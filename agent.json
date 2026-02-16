@@ -1,0 +1,14 @@
+{
+  "label": "Describe",
+  "description": "Generates AI-powered descriptions for entities. Gathers context from properties and relationships, calls LLM, and updates the entity. Supports label generation and prompt customization.",
+  "endpoint": "https://describe.nick-chimicles-professional.workers.dev",
+  "actions_required": ["entity:view", "entity:update"],
+  "accepts": {
+    "types": ["*"],
+    "cardinality": "one"
+  },
+  "produces": {
+    "types": ["*"],
+    "cardinality": "one"
+  }
+}
