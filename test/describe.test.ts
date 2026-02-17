@@ -105,7 +105,7 @@ and oral histories from families who lived through this transformative period.`,
         date: '1932-05-15',
         source: 'University Archives',
       },
-      collectionId: targetCollection.id,
+      collection: targetCollection.id,
     });
     log(`Created basic entity: ${basicEntity.id}`);
 
@@ -117,7 +117,7 @@ and oral histories from families who lived through this transformative period.`,
         description: 'A collection of documents from the Smith family archive',
         date_range: '1890-1945',
       },
-      collectionId: targetCollection.id,
+      collection: targetCollection.id,
     });
     log(`Created parent entity: ${parentEntity.id}`);
 
