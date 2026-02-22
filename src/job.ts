@@ -28,7 +28,7 @@ import {
 } from './context';
 import { applyProgressiveTax, estimateTokens } from './truncation';
 import { buildSystemPrompt, buildUserPrompt, estimateSystemPromptTokens } from './prompts';
-import { callGemini, parseDescribeResult } from './gemini';
+import { callGeminiWithJsonRetry } from './gemini';
 
 export interface ProcessContext {
   request: KladosRequest;
@@ -63,8 +63,11 @@ function parseConfig(input: Record<string, unknown> | undefined): Required<Descr
   };
 }
 
+const CAS_MAX_RETRIES = 5;
+const CAS_BASE_DELAY_MS = 100;
+
 /**
- * Update entity with generated description
+ * Update entity with generated description (with CAS retry)
  */
 async function updateEntity(
   client: ArkeClient,
@@ -72,15 +75,6 @@ async function updateEntity(
   result: { description: string; title?: string; label?: string },
   config: DescribeConfig
 ): Promise<void> {
-  // Get current tip for CAS-safe update
-  const { data: tip, error: tipError } = await client.api.GET('/entities/{id}/tip', {
-    params: { path: { id: entityId } },
-  });
-
-  if (tipError || !tip) {
-    throw new Error(`Failed to get tip for ${entityId}: ${JSON.stringify(tipError)}`);
-  }
-
   // Build update properties
   const properties: Record<string, unknown> = {
     description: result.description,
@@ -96,17 +90,40 @@ async function updateEntity(
     properties.label = result.label;
   }
 
-  // Update entity
-  const { error: updateError } = await client.api.PUT('/entities/{id}', {
-    params: { path: { id: entityId } },
-    body: {
-      expect_tip: tip.cid,
-      properties,
-    },
-  });
+  // CAS retry loop
+  for (let attempt = 0; attempt < CAS_MAX_RETRIES; attempt++) {
+    // Get current tip for CAS-safe update
+    const { data: tip, error: tipError } = await client.api.GET('/entities/{id}/tip', {
+      params: { path: { id: entityId } },
+    });
 
-  if (updateError) {
-    throw new Error(`Failed to update entity: ${JSON.stringify(updateError)}`);
+    if (tipError || !tip) {
+      throw new Error(`Failed to get tip for ${entityId}: ${JSON.stringify(tipError)}`);
+    }
+
+    // Update entity
+    const { error: updateError } = await client.api.PUT('/entities/{id}', {
+      params: { path: { id: entityId } },
+      body: {
+        expect_tip: tip.cid,
+        properties,
+      },
+    });
+
+    if (!updateError) {
+      return; // Success
+    }
+
+    // Check if CAS failure (retryable)
+    const errorStr = JSON.stringify(updateError);
+    if (errorStr.includes('CAS failure') && attempt < CAS_MAX_RETRIES - 1) {
+      const delay = CAS_BASE_DELAY_MS * Math.pow(2, attempt);
+      console.log(`[describe] CAS conflict on attempt ${attempt + 1}, retrying in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      continue;
+    }
+
+    throw new Error(`Failed to update entity: ${errorStr}`);
   }
 }
 
@@ -252,16 +269,17 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
         userPromptLength: userPrompt.length,
       });
 
-      // Call Gemini
-      const geminiResponse = await callGemini(env.GEMINI_API_KEY, systemPrompt, userPrompt);
+      // Call Gemini with JSON retry (retries up to 3 times on parse failure)
+      const { response: geminiResponse, result } = await callGeminiWithJsonRetry(
+        env.GEMINI_API_KEY,
+        systemPrompt,
+        userPrompt
+      );
 
       logger.info('Gemini response', {
         tokens: geminiResponse.tokens,
         cost: `$${geminiResponse.cost_usd.toFixed(4)}`,
       });
-
-      // Parse result
-      const result = parseDescribeResult(geminiResponse.content);
 
       // Update entity
       await updateEntity(client, request.target_entity!, result, config);

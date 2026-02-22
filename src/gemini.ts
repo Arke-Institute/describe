@@ -184,3 +184,88 @@ export function parseDescribeResult(content: string): DescribeResult {
     };
   }
 }
+
+const JSON_PARSE_MAX_RETRIES = 3;
+
+/**
+ * Call Gemini and parse JSON response with retry on parse failure
+ *
+ * If JSON parsing fails, retries with error context appended to prompt
+ * so the model can correct its output.
+ */
+export async function callGeminiWithJsonRetry(
+  apiKey: string,
+  systemPrompt: string,
+  userPrompt: string
+): Promise<{ response: GeminiResponse; result: DescribeResult }> {
+  let lastResponse: GeminiResponse | null = null;
+  let lastError: string | null = null;
+
+  for (let attempt = 0; attempt < JSON_PARSE_MAX_RETRIES; attempt++) {
+    // Build prompt - append error context if retrying
+    let effectiveUserPrompt = userPrompt;
+    if (lastResponse && lastError) {
+      const truncatedContent = lastResponse.content.length > 2000
+        ? lastResponse.content.slice(0, 2000) + '...[truncated]'
+        : lastResponse.content;
+
+      effectiveUserPrompt += `
+
+## RETRY - JSON PARSE ERROR
+
+Your previous response could not be parsed as valid JSON.
+
+**Error:** ${lastError}
+
+**Your response was:**
+\`\`\`
+${truncatedContent}
+\`\`\`
+
+Please provide a valid JSON response with the required fields: title, description.`;
+    }
+
+    // Call Gemini (has its own retry for HTTP errors)
+    const response = await callGemini(apiKey, systemPrompt, effectiveUserPrompt);
+
+    // Try to parse JSON
+    try {
+      const parsed = JSON.parse(response.content);
+
+      // Validate required fields
+      if (typeof parsed.description !== 'string') {
+        throw new Error('Missing or invalid "description" field');
+      }
+
+      if (attempt > 0) {
+        console.log(`[Gemini] JSON parsed successfully after ${attempt + 1} attempts`);
+      }
+
+      return {
+        response,
+        result: {
+          description: parsed.description,
+          title: parsed.title,
+          label: parsed.label,
+        }
+      };
+    } catch (e) {
+      lastResponse = response;
+      lastError = e instanceof Error ? e.message : String(e);
+
+      console.error(`[Gemini] JSON parse failed (attempt ${attempt + 1}/${JSON_PARSE_MAX_RETRIES}):`, lastError);
+
+      if (attempt < JSON_PARSE_MAX_RETRIES - 1) {
+        console.log('[Gemini] Retrying with error feedback...');
+      }
+    }
+  }
+
+  // All retries exhausted - throw error
+  const preview = lastResponse?.content.slice(0, 200) || 'no response';
+  throw new Error(
+    `Failed to get valid JSON after ${JSON_PARSE_MAX_RETRIES} attempts. ` +
+    `Last error: ${lastError}. ` +
+    `Last response preview: ${preview}...`
+  );
+}
