@@ -1,14 +1,374 @@
 {
+  "schema_version": "1.0",
+
   "label": "Describe",
-  "description": "Generates AI-powered descriptions for entities. Gathers context from properties and relationships, calls LLM, and updates the entity. Supports label generation and prompt customization.",
+  "description": "Generates AI-powered descriptions for entities using Gemini, gathering context from properties and relationships, with intelligent truncation and customizable output styles.",
+
+  "detailed_description": "## Overview\n\nThe Describe klados generates comprehensive, context-aware descriptions for any entity type. It gathers the target entity along with all related entities (via relationships), applies intelligent truncation to fit within token limits, and uses Gemini to generate a high-quality description.\n\n## How It Works\n\n1. **FETCH_TARGET phase**: Fetches the target entity and extracts relationship IDs\n2. **FETCH_BATCH phase**: Batch-fetches related entities (100 at a time) to build context\n3. **GENERATE phase**: Applies progressive tax truncation, builds prompts, calls Gemini, updates entity\n\n## Key Features\n\n- **Relationship-aware**: Incorporates context from all related entities\n- **Progressive truncation**: Larger text fields are proportionally truncated to fit token budget\n- **Customizable output**: Supports multiple styles (concise, detailed, academic, casual)\n- **Entity linking**: Generated descriptions can include arke: links to related entities\n- **CAS-safe updates**: Uses CAS retry logic to handle concurrent modifications\n\n## When to Use\n\n- Generating descriptions for extracted entities after KG Extractor\n- Enriching cluster descriptions after KG Cluster\n- Regenerating descriptions with more context as relationships are added\n- Updating descriptions with a specific focus or style\n\n## Limitations\n\n- Requires a target entity with an ID (cannot generate descriptions for new entities)\n- Large context (1000+ relationships) may take longer due to batch fetching\n- Output is limited to description, title, and optionally label",
+
   "endpoint": "https://describe.nick-chimicles-professional.workers.dev",
   "actions_required": ["entity:view", "entity:update"],
-  "accepts": {
-    "types": ["*"],
+
+  "input": {
+    "entity": {
+      "types": ["*"],
+      "types_description": "Any entity type. Works with clusters, extracted entities, documents, or any entity that would benefit from a generated description.",
+
+      "properties": {
+        "required": {},
+        "optional": {
+          "label": {
+            "type": "string",
+            "description": "Name of the entity, included in prompt context. Protected from truncation."
+          },
+          "description": {
+            "type": "string",
+            "description": "Existing description (if any). Will be replaced by the generated description."
+          },
+          "text": {
+            "type": "string",
+            "description": "Text content that may be used as context for description generation."
+          },
+          "content": {
+            "type": "string",
+            "description": "Alternative to text property. Any text content used as context."
+          }
+        },
+        "notes": "All string properties are included as context. Properties under 300 chars are protected from truncation. Large text fields (text, content, description) may be truncated proportionally."
+      },
+
+      "file": {
+        "required": false,
+        "description": "File attachments are not directly used. Text should be in properties."
+      },
+
+      "relationships": {
+        "required": {},
+        "optional": {
+          "any": {
+            "description": "All outgoing relationships are fetched and included as context. Related entities' properties contribute to the description generation."
+          }
+        },
+        "notes": "More relationships = richer context but longer processing. Use predicates filter to limit which relationships are fetched."
+      }
+    },
+
+    "klados_input": {
+      "description": "Parameters passed via the rhiza workflow input field to customize description generation.",
+      "properties": {
+        "optional": {
+          "update_label": {
+            "type": "boolean",
+            "description": "If true, also generates and updates a concise label (2-5 words) for the entity.",
+            "default": false
+          },
+          "max_relationships": {
+            "type": "integer",
+            "description": "Maximum number of relationships to fetch for context.",
+            "default": 1000,
+            "minimum": 0,
+            "maximum": 10000
+          },
+          "predicates": {
+            "type": "string[]",
+            "description": "Filter to only fetch relationships with these predicates. Empty array means all predicates.",
+            "default": [],
+            "examples": [["contains", "extracted_from"], ["cluster_member"]]
+          },
+          "batch_size": {
+            "type": "integer",
+            "description": "Number of entities to fetch per batch-get call.",
+            "default": 100,
+            "minimum": 1,
+            "maximum": 500
+          },
+          "context_window_tokens": {
+            "type": "integer",
+            "description": "Model context window size for token budget calculation.",
+            "default": 128000
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "description": "Tokens reserved for model output.",
+            "default": 8000
+          },
+          "safety_margin": {
+            "type": "number",
+            "description": "Buffer ratio to avoid hitting token limits. 0.8 means use 80% of available budget.",
+            "default": 0.8,
+            "minimum": 0.5,
+            "maximum": 1.0
+          },
+          "style": {
+            "type": "string",
+            "description": "Writing style for the generated description.",
+            "enum": ["concise", "detailed", "academic", "casual"],
+            "default": "detailed"
+          },
+          "custom_instructions": {
+            "type": "string",
+            "description": "Additional instructions appended to the system prompt for customizing output."
+          },
+          "focus": {
+            "type": "string",
+            "description": "What aspect of the entity to emphasize in the description."
+          }
+        }
+      }
+    },
+
     "cardinality": "one"
   },
-  "produces": {
-    "types": ["*"],
+
+  "output": {
+    "entities": {
+      "creates": {
+        "types": [],
+        "description": "This klados does not create new entities."
+      },
+
+      "modifies": {
+        "target": "input entity",
+        "description": "Updates the target entity with generated description and metadata.",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "The AI-generated description (markdown supported, may include arke: entity links)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Human-readable title generated for the entity.",
+            "condition": "Always generated."
+          },
+          "label": {
+            "type": "string",
+            "description": "Concise label (2-5 words) for the entity.",
+            "condition": "Only when update_label=true in input."
+          },
+          "description_generated_at": {
+            "type": "string",
+            "description": "ISO 8601 timestamp of when the description was generated."
+          },
+          "description_model": {
+            "type": "string",
+            "description": "The model used for generation (e.g., 'gemini-2.5-flash')."
+          }
+        }
+      }
+    },
+
+    "handoff": {
+      "outputs": "The target entity ID",
+      "description": "Returns the target entity ID to the next workflow step. Useful for chaining with other description-related operations."
+    },
+
     "cardinality": "one"
+  },
+
+  "behavior": {
+    "processing": {
+      "tier": 2,
+      "tier_description": "Uses Durable Objects with SQL storage. Implements a three-phase state machine (FETCH_TARGET, FETCH_BATCH, GENERATE) with checkpointing between phases.",
+      "typical_duration": "5-30 seconds for entities with few relationships, 1-2 minutes for entities with 500+ relationships.",
+      "idempotent": false,
+      "idempotent_description": "Re-running will regenerate and overwrite the description. Not harmful but may be wasteful."
+    },
+
+    "constraints": {
+      "token_budget": "Uses 128K context window by default. Context is intelligently truncated to fit within (context_window - max_output - system_prompt) * safety_margin.",
+      "rate_limits": "Subject to Gemini API rate limits. Free tier: 60 RPM. Paid tier: higher limits.",
+      "relationships": "Fetches up to max_relationships (default 1000). More relationships = richer context but longer processing.",
+      "concurrency": "Safe to run multiple instances. Each job gets its own DO instance keyed by job_id."
+    },
+
+    "error_handling": {
+      "no_target_entity": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "No target_entity in request"
+      },
+      "entity_not_found": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "Failed to fetch target entity {id}: ..."
+      },
+      "gemini_api_error": {
+        "behavior": "Retries with exponential backoff (3 attempts, 15s-120s delays)",
+        "log_status": "error",
+        "message": "Gemini API error (status): message"
+      },
+      "json_parse_failure": {
+        "behavior": "Retries with error feedback (up to 3 attempts). Appends parse error to prompt so model can correct.",
+        "log_status": "error",
+        "message": "Failed to get valid JSON after 3 attempts"
+      },
+      "cas_conflict": {
+        "behavior": "Retries entity update with exponential backoff (5 attempts, 100ms-1.6s delays)",
+        "log_status": "error",
+        "message": "Failed to update entity: CAS failure"
+      }
+    },
+
+    "side_effects": [
+      "Updates target entity with description, title, and metadata properties",
+      "Optionally updates label property if update_label=true",
+      "Consumes Gemini API quota (~500-5000 tokens per invocation)"
+    ]
+  },
+
+  "examples": [
+    {
+      "name": "Basic entity description",
+      "description": "Generate a description for a person entity with related context",
+
+      "input": {
+        "entity": {
+          "id": "ENTITY_PERSON_001",
+          "type": "person",
+          "properties": {
+            "label": "Marie Curie"
+          },
+          "relationships": [
+            { "predicate": "born_in", "peer": "ENTITY_WARSAW" },
+            { "predicate": "worked_at", "peer": "ENTITY_PARIS_UNIV" },
+            { "predicate": "discovered", "peer": "ENTITY_RADIUM" }
+          ]
+        },
+        "klados_input": {}
+      },
+
+      "output": {
+        "entity_modified": {
+          "id": "ENTITY_PERSON_001",
+          "properties_updated": {
+            "title": "Marie Curie: Pioneer of Radioactivity",
+            "description": "Marie Curie was a pioneering physicist and chemist who conducted groundbreaking research on radioactivity. Born in [Warsaw](arke:ENTITY_WARSAW), she later moved to Paris where she worked at the [University of Paris](arke:ENTITY_PARIS_UNIV). Her most significant achievement was the discovery of [radium](arke:ENTITY_RADIUM), which earned her two Nobel Prizes.",
+            "description_generated_at": "2024-01-15T10:30:00.000Z",
+            "description_model": "gemini-2.5-flash"
+          }
+        },
+        "handoff_outputs": ["ENTITY_PERSON_001"]
+      }
+    },
+
+    {
+      "name": "Cluster description with style",
+      "description": "Generate a concise description for a cluster entity",
+
+      "input": {
+        "entity": {
+          "id": "CLUSTER_ABC",
+          "type": "cluster",
+          "properties": {
+            "label": "European Scientists"
+          },
+          "relationships": [
+            { "predicate": "cluster_member", "peer": "ENTITY_CURIE" },
+            { "predicate": "cluster_member", "peer": "ENTITY_EINSTEIN" },
+            { "predicate": "cluster_member", "peer": "ENTITY_BOHR" }
+          ]
+        },
+        "klados_input": {
+          "style": "concise",
+          "predicates": ["cluster_member"]
+        }
+      },
+
+      "output": {
+        "entity_modified": {
+          "id": "CLUSTER_ABC",
+          "properties_updated": {
+            "title": "European Scientists Cluster",
+            "description": "A cluster of influential European scientists including Marie Curie, Albert Einstein, and Niels Bohr. These physicists made foundational contributions to modern physics and chemistry in the early 20th century.",
+            "description_generated_at": "2024-01-15T10:35:00.000Z",
+            "description_model": "gemini-2.5-flash"
+          }
+        },
+        "handoff_outputs": ["CLUSTER_ABC"]
+      },
+
+      "notes": "Style 'concise' produces 2-3 sentence descriptions. The predicates filter limited context to only cluster_member relationships."
+    },
+
+    {
+      "name": "Document with custom focus",
+      "description": "Generate a description for a document with specific focus area",
+
+      "input": {
+        "entity": {
+          "id": "DOC_RESEARCH_PAPER",
+          "type": "document",
+          "properties": {
+            "label": "Climate Change Impact Study",
+            "text": "This comprehensive study examines the effects of climate change on coastal ecosystems, focusing on sea level rise, ocean acidification, and their combined impact on marine biodiversity. The research was conducted across 15 coastal regions over a 10-year period..."
+          }
+        },
+        "klados_input": {
+          "style": "academic",
+          "focus": "methodology and key findings",
+          "update_label": true
+        }
+      },
+
+      "output": {
+        "entity_modified": {
+          "id": "DOC_RESEARCH_PAPER",
+          "properties_updated": {
+            "label": "Coastal Ecosystem Climate Study",
+            "title": "Longitudinal Analysis of Climate Change Effects on Coastal Marine Ecosystems",
+            "description": "This longitudinal study presents a systematic analysis of climate change impacts on coastal ecosystems across 15 distinct coastal regions, spanning a decade of observational data. The methodology employs multi-variable analysis of sea level rise and ocean acidification metrics, correlated with biodiversity indices. Key findings indicate...",
+            "description_generated_at": "2024-01-15T10:40:00.000Z",
+            "description_model": "gemini-2.5-flash"
+          }
+        },
+        "handoff_outputs": ["DOC_RESEARCH_PAPER"]
+      },
+
+      "notes": "Academic style uses formal language. Focus parameter directs attention to specific aspects. update_label=true also generates a new label."
+    }
+  ],
+
+  "metadata": {
+    "version": "1.0.0",
+    "author": "Arke Institute",
+
+    "tags": ["description", "generation", "nlp", "gemini", "context-aware", "tier-2", "entity-enrichment"],
+
+    "related_kladoi": {
+      "prerequisites": [],
+      "often_used_with": [
+        {
+          "label": "KG Extractor",
+          "description": "Extract entities from text, then use Describe to generate rich descriptions.",
+          "when": "After extraction to enrich entity descriptions with more context."
+        },
+        {
+          "label": "KG Cluster",
+          "description": "Cluster similar entities, then use Describe to generate cluster descriptions.",
+          "when": "After clustering to create meaningful cluster summaries."
+        },
+        {
+          "label": "KG Dedupe Resolver",
+          "description": "Deduplicate entities, then regenerate descriptions for merged entities.",
+          "when": "After deduplication when entity context has changed."
+        }
+      ],
+      "workflows": [
+        {
+          "label": "scatter-kg",
+          "description": "Full extraction pipeline: scatter -> extract -> dedupe -> cluster -> describe"
+        },
+        {
+          "label": "scatter-kg-recursive",
+          "description": "Recursive clustering variant that describes clusters at each hierarchy level"
+        }
+      ]
+    },
+
+    "costs": {
+      "api_calls": "1 Gemini API call per invocation (with up to 3 retries on parse failure)",
+      "typical_tokens": "Input: 1000-50000 tokens (depends on context size), Output: 200-1000 tokens",
+      "estimated_cost": "$0.001-0.02 per entity depending on context size"
+    }
   }
 }
