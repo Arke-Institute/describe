@@ -2,9 +2,9 @@
   "schema_version": "1.0",
 
   "label": "Describe",
-  "description": "Generates AI-powered descriptions for entities using Gemini, gathering context from properties and relationships, with intelligent truncation and customizable output styles.",
+  "description": "Generates AI-powered descriptions for entities using Gemini. Supports text properties, relationships, and file content (images, PDFs, documents up to 50MB). Streams files directly to Gemini Files API without memory buffering.",
 
-  "detailed_description": "## Overview\n\nThe Describe klados generates comprehensive, context-aware descriptions for any entity type. It gathers the target entity along with all related entities (via relationships), applies intelligent truncation to fit within token limits, and uses Gemini to generate a high-quality description.\n\n## How It Works\n\n1. **FETCH_TARGET phase**: Fetches the target entity and extracts relationship IDs\n2. **FETCH_BATCH phase**: Batch-fetches related entities (100 at a time) to build context\n3. **GENERATE phase**: Applies progressive tax truncation, builds prompts, calls Gemini, updates entity\n\n## Key Features\n\n- **Relationship-aware**: Incorporates context from all related entities\n- **Progressive truncation**: Larger text fields are proportionally truncated to fit token budget\n- **Customizable output**: Supports multiple styles (concise, detailed, academic, casual)\n- **Entity linking**: Generated descriptions can include arke: links to related entities\n- **CAS-safe updates**: Uses CAS retry logic to handle concurrent modifications\n\n## When to Use\n\n- Generating descriptions for extracted entities after KG Extractor\n- Enriching cluster descriptions after KG Cluster\n- Regenerating descriptions with more context as relationships are added\n- Updating descriptions with a specific focus or style\n\n## Limitations\n\n- Requires a target entity with an ID (cannot generate descriptions for new entities)\n- Large context (1000+ relationships) may take longer due to batch fetching\n- Output is limited to description, title, and optionally label",
+  "detailed_description": "## Overview\n\nThe Describe klados generates comprehensive, context-aware descriptions for any entity type. It gathers the target entity along with all related entities (via relationships), uploads any file content (images, PDFs, documents), applies intelligent truncation to fit within token limits, and uses Gemini to generate a high-quality description.\n\n## How It Works\n\n1. **FETCH_TARGET phase**: Fetches the target entity, extracts relationship IDs, and identifies file content keys\n2. **UPLOAD_CONTENT phase**: Streams file content directly to Gemini Files API (no memory buffering)\n3. **FETCH_BATCH phase**: Batch-fetches related entities (100 at a time) to build context\n4. **GENERATE phase**: Applies progressive truncation, builds prompts with file references, calls Gemini, updates entity\n\n## Key Features\n\n- **Multimodal support**: Handles images (JPEG, PNG, GIF, WebP), PDFs, and documents alongside text\n- **Streaming uploads**: Files stream directly from Arke to Gemini via FixedLengthStream - no memory buffering\n- **Large file support**: Handles files up to 50MB (configurable) without memory issues\n- **Relationship-aware**: Incorporates context from all related entities\n- **Progressive truncation**: Larger text fields are proportionally truncated to fit token budget\n- **Customizable output**: Supports multiple styles (concise, detailed, academic, casual)\n- **Entity linking**: Generated descriptions can include arke: links to related entities\n- **CAS-safe updates**: Uses CAS retry logic to handle concurrent modifications\n\n## When to Use\n\n- Describing uploaded images, PDFs, or scanned documents\n- Generating descriptions for extracted entities after KG Extractor\n- Enriching cluster descriptions after KG Cluster\n- Regenerating descriptions with more context as relationships are added\n- Updating descriptions with a specific focus or style\n\n## Limitations\n\n- Requires a target entity with an ID (cannot generate descriptions for new entities)\n- Large context (1000+ relationships) may take longer due to batch fetching\n- Output is limited to description, title, and optionally label\n- File URIs from Gemini expire after 48 hours (stored refs may become stale)",
 
   "endpoint": "https://describe.nick-chimicles-professional.workers.dev",
   "actions_required": ["entity:view", "entity:update"],
@@ -39,7 +39,10 @@
 
       "file": {
         "required": false,
-        "description": "File attachments are not directly used. Text should be in properties."
+        "supported": true,
+        "description": "File content stored in properties.content is automatically uploaded to Gemini Files API and included in the description prompt. Supports images (JPEG, PNG, GIF, WebP), PDFs, and documents up to 50MB per file.",
+        "supported_types": ["image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf", "text/plain", "text/html", "text/css", "text/javascript", "application/json", "application/xml"],
+        "max_size": "50MB per file (configurable via max_content_size)"
       },
 
       "relationships": {
@@ -112,6 +115,23 @@
           "focus": {
             "type": "string",
             "description": "What aspect of the entity to emphasize in the description."
+          },
+          "include_content": {
+            "type": "boolean",
+            "description": "Whether to upload and include file content from properties.content in the prompt.",
+            "default": true
+          },
+          "content_keys": {
+            "type": "string[]",
+            "description": "Specific content keys to include. If omitted, all content keys are included.",
+            "default": "all keys",
+            "examples": [["original", "thumbnail"], ["page_001.jpeg", "page_002.jpeg"]]
+          },
+          "max_content_size": {
+            "type": "integer",
+            "description": "Maximum file size in bytes to upload. Larger files are skipped with 'too_large' status.",
+            "default": 52428800,
+            "notes": "Default is 50MB. Set lower to skip large files and rely on text context only."
           }
         }
       }
@@ -168,7 +188,7 @@
   "behavior": {
     "processing": {
       "tier": 2,
-      "tier_description": "Uses Durable Objects with SQL storage. Implements a three-phase state machine (FETCH_TARGET, FETCH_BATCH, GENERATE) with checkpointing between phases.",
+      "tier_description": "Uses Durable Objects with SQL storage. Implements a four-phase state machine (FETCH_TARGET, UPLOAD_CONTENT, FETCH_BATCH, GENERATE) with checkpointing between phases. File uploads stream directly to Gemini Files API using FixedLengthStream.",
       "typical_duration": "5-30 seconds for entities with few relationships, 1-2 minutes for entities with 500+ relationships.",
       "idempotent": false,
       "idempotent_description": "Re-running will regenerate and overwrite the description. Not harmful but may be wasteful."
@@ -176,6 +196,8 @@
 
     "constraints": {
       "token_budget": "Uses 128K context window by default. Context is intelligently truncated to fit within (context_window - max_output - system_prompt) * safety_margin.",
+      "file_size": "Files up to 50MB per file (configurable). Larger files are skipped. Total Gemini Files API limit is 2GB.",
+      "file_ttl": "Gemini file_uri references expire after 48 hours. Re-invoke if descriptions need regenerating with same files.",
       "rate_limits": "Subject to Gemini API rate limits. Free tier: 60 RPM. Paid tier: higher limits.",
       "relationships": "Fetches up to max_relationships (default 1000). More relationships = richer context but longer processing.",
       "concurrency": "Safe to run multiple instances. Each job gets its own DO instance keyed by job_id."
@@ -212,7 +234,8 @@
     "side_effects": [
       "Updates target entity with description, title, and metadata properties",
       "Optionally updates label property if update_label=true",
-      "Consumes Gemini API quota (~500-5000 tokens per invocation)"
+      "Uploads file content to Gemini Files API (files expire after 48 hours)",
+      "Consumes Gemini API quota (~500-5000 tokens per invocation, more for multimodal)"
     ]
   },
 
@@ -325,14 +348,98 @@
       },
 
       "notes": "Academic style uses formal language. Focus parameter directs attention to specific aspects. update_label=true also generates a new label."
+    },
+
+    {
+      "name": "PDF document with file content",
+      "description": "Generate a description for an entity with uploaded PDF content",
+
+      "input": {
+        "entity": {
+          "id": "DOC_SCANNED_BOOK",
+          "type": "document",
+          "properties": {
+            "label": "The Children's Best Story Book",
+            "content": {
+              "book.pdf": {
+                "cid": "bafkreiabc123...",
+                "content_type": "application/pdf",
+                "size": 47000000,
+                "uploaded_at": "2024-01-15T08:00:00.000Z"
+              }
+            }
+          }
+        },
+        "klados_input": {
+          "style": "detailed",
+          "content_keys": ["book.pdf"]
+        }
+      },
+
+      "output": {
+        "entity_modified": {
+          "id": "DOC_SCANNED_BOOK",
+          "properties_updated": {
+            "title": "The Children's Best Story Book: A Victorian Collection",
+            "description": "This document is a digitized version of 'The Children's Best Story Book,' a Victorian-era anthology published for young readers. The 47-page PDF contains illustrated tales with ornate typography characteristic of late 19th century children's literature. The stories feature moral lessons wrapped in fantastical narratives, with detailed engravings accompanying each chapter.",
+            "description_generated_at": "2024-01-15T10:45:00.000Z",
+            "description_model": "gemini-2.5-flash"
+          }
+        },
+        "handoff_outputs": ["DOC_SCANNED_BOOK"]
+      },
+
+      "notes": "The 47MB PDF is streamed directly to Gemini Files API without buffering in memory. Gemini analyzes the full document content including text and images."
+    },
+
+    {
+      "name": "Image entity description",
+      "description": "Generate a description for an entity with uploaded image content",
+
+      "input": {
+        "entity": {
+          "id": "IMG_HISTORICAL_PHOTO",
+          "type": "image",
+          "properties": {
+            "label": "Unknown Historical Photo",
+            "content": {
+              "original.jpeg": {
+                "cid": "bafkreixyz789...",
+                "content_type": "image/jpeg",
+                "size": 122800,
+                "uploaded_at": "2024-01-15T09:00:00.000Z"
+              }
+            }
+          }
+        },
+        "klados_input": {
+          "style": "detailed",
+          "focus": "identify subjects and historical context"
+        }
+      },
+
+      "output": {
+        "entity_modified": {
+          "id": "IMG_HISTORICAL_PHOTO",
+          "properties_updated": {
+            "title": "Victorian-Era Biblical Illustration",
+            "description": "This image depicts a colorized biblical scene from a late 19th century illustrated book. The artwork shows figures in traditional Middle Eastern garments, with detailed hand-tinted coloring typical of Victorian book illustrations. The style suggests this is from a children's religious education publication.",
+            "description_generated_at": "2024-01-15T10:50:00.000Z",
+            "description_model": "gemini-2.5-flash"
+          }
+        },
+        "handoff_outputs": ["IMG_HISTORICAL_PHOTO"]
+      },
+
+      "notes": "Images are uploaded to Gemini Files API and analyzed visually. The focus parameter directs Gemini to emphasize identification and historical context."
     }
   ],
 
   "metadata": {
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "Arke Institute",
 
-    "tags": ["description", "generation", "nlp", "gemini", "context-aware", "tier-2", "entity-enrichment"],
+    "tags": ["description", "generation", "nlp", "gemini", "context-aware", "tier-2", "entity-enrichment", "multimodal", "images", "pdf", "files"],
 
     "related_kladoi": {
       "prerequisites": [],
