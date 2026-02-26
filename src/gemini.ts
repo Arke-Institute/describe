@@ -269,3 +269,211 @@ Please provide a valid JSON response with the required fields: title, descriptio
     `Last response preview: ${preview}...`
   );
 }
+
+/**
+ * Stream content from Arke → Gemini Files API using FixedLengthStream
+ *
+ * This enables true streaming without buffering the entire file in memory.
+ * The FixedLengthStream allows us to set Content-Length while still streaming.
+ *
+ * @param arkeKey - Arke API key for fetching content
+ * @param geminiKey - Gemini API key for uploading
+ * @param arkeBase - Arke API base URL
+ * @param entityId - Entity ID to fetch content from
+ * @param contentKey - Content key within the entity
+ * @param contentType - MIME type of the content
+ * @param knownSize - Known size in bytes (from entity metadata)
+ */
+export async function streamToGeminiFiles(
+  arkeKey: string,
+  geminiKey: string,
+  arkeBase: string,
+  entityId: string,
+  contentKey: string,
+  contentType: string,
+  knownSize: number
+): Promise<{ fileUri: string; uploadedBytes: number }> {
+  // 1. Start resumable upload session with Gemini
+  const startResponse = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${geminiKey}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(knownSize),
+        'X-Goog-Upload-Header-Content-Type': contentType,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file: { displayName: contentKey },
+      }),
+    }
+  );
+
+  if (!startResponse.ok) {
+    const err = await startResponse.text();
+    throw new Error(`Gemini upload start failed: ${startResponse.status} - ${err}`);
+  }
+
+  // Get the upload URL from response header
+  const uploadUrl = startResponse.headers.get('X-Goog-Upload-URL');
+  if (!uploadUrl) {
+    throw new Error('No upload URL returned from Gemini');
+  }
+
+  console.log(`[Gemini] Got upload URL, fetching content from Arke...`);
+
+  // 2. Fetch content stream from Arke
+  const arkeResponse = await fetch(
+    `${arkeBase}/entities/${entityId}/content?key=${encodeURIComponent(contentKey)}`,
+    { headers: { Authorization: `ApiKey ${arkeKey}` } }
+  );
+
+  if (!arkeResponse.ok) {
+    const err = await arkeResponse.text();
+    throw new Error(`Arke content fetch failed: ${arkeResponse.status} - ${err}`);
+  }
+
+  if (!arkeResponse.body) {
+    throw new Error('Arke response has no body');
+  }
+
+  console.log(`[Gemini] Streaming ${knownSize} bytes to Gemini...`);
+
+  // 3. Create FixedLengthStream for Content-Length with streaming
+  const { readable, writable } = new FixedLengthStream(knownSize);
+
+  // 4. Pipe Arke response → FixedLengthStream (runs in background)
+  const pipePromise = arkeResponse.body.pipeTo(writable).catch((err) => {
+    console.error('[Gemini] Pipe error:', err);
+    throw err;
+  });
+
+  // 5. Upload to Gemini using the FixedLengthStream's readable side
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(knownSize),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: readable,
+  });
+
+  // Wait for pipe to complete
+  await pipePromise;
+
+  if (!uploadResponse.ok) {
+    const err = await uploadResponse.text();
+    throw new Error(`Gemini upload failed: ${uploadResponse.status} - ${err}`);
+  }
+
+  // 6. Parse response to get file URI
+  const result = (await uploadResponse.json()) as { file: { uri: string; name: string } };
+
+  console.log(`[Gemini] Upload complete: ${result.file.uri}`);
+
+  return {
+    fileUri: result.file.uri,
+    uploadedBytes: knownSize,
+  };
+}
+
+/**
+ * Call Gemini with multimodal content (text + files)
+ */
+export async function callGeminiMultimodal(
+  apiKey: string,
+  systemPrompt: string,
+  userPrompt: string,
+  fileRefs: Array<{ fileUri: string; mimeType: string }>
+): Promise<GeminiResponse> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
+
+  // Build parts array: files first, then text
+  const parts: Array<{ file_data?: { file_uri: string; mime_type: string }; text?: string }> = [];
+
+  // Add file references
+  for (const ref of fileRefs) {
+    parts.push({
+      file_data: {
+        file_uri: ref.fileUri,
+        mime_type: ref.mimeType,
+      },
+    });
+  }
+
+  // Add text prompt
+  parts.push({ text: userPrompt });
+
+  const body = {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: 'user', parts }],
+    generationConfig: {
+      maxOutputTokens: 8192,
+      temperature: 0.7,
+      responseMimeType: 'application/json',
+    },
+  };
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[Gemini] Multimodal attempt ${attempt + 1}/${MAX_RETRIES + 1} with ${fileRefs.length} files...`);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.status === 429 || response.status >= 500) {
+        const errorText = await response.text();
+        console.error(`[Gemini] Error ${response.status}: ${errorText}`);
+
+        if (attempt < MAX_RETRIES) {
+          const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
+          console.log(`[Gemini] Retrying in ${delay}ms...`);
+          await sleep(delay);
+          continue;
+        }
+        throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+      }
+
+      const data = await response.json();
+
+      const finishReason = (data as { candidates?: Array<{ finishReason?: string }> })
+        .candidates?.[0]?.finishReason;
+      console.log(`[Gemini] Finish reason: ${finishReason}`);
+
+      if (finishReason === 'MAX_TOKENS') {
+        console.warn('[Gemini] WARNING: Output truncated due to max tokens limit');
+      }
+
+      return parseGeminiResponse(data);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      if (attempt < MAX_RETRIES) {
+        const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
+        console.log(`[Gemini] Error: ${lastError.message}, retrying in ${delay}ms...`);
+        await sleep(delay);
+      }
+    }
+  }
+
+  throw lastError || new Error('Gemini multimodal request failed');
+}

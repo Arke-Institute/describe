@@ -11,6 +11,7 @@ import type {
   JobPhase,
   JobState,
   RelationshipRef,
+  ContentRef,
 } from './types';
 
 /**
@@ -32,6 +33,18 @@ export function initSchema(sql: SqlStorage): void {
     CREATE TABLE IF NOT EXISTS describe_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    )
+  `);
+
+  // Create content refs table - stores Gemini file URIs (not content itself)
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS content_refs (
+      key TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      content_type TEXT,
+      size INTEGER,
+      file_uri TEXT,
+      reason TEXT
     )
   `);
 }
@@ -110,6 +123,10 @@ export function getJobState(sql: SqlStorage): JobState {
     relationshipIds: state.relationshipIds
       ? (JSON.parse(state.relationshipIds) as RelationshipRef[])
       : [],
+    contentKeys: state.contentKeys
+      ? (JSON.parse(state.contentKeys) as string[])
+      : [],
+    contentIndex: parseInt(state.contentIndex || '0', 10),
   };
 }
 
@@ -134,6 +151,7 @@ export function setJobState(sql: SqlStorage, updates: Partial<JobState>): void {
 export function clearState(sql: SqlStorage): void {
   sql.exec(`DELETE FROM entities`);
   sql.exec(`DELETE FROM describe_state`);
+  sql.exec(`DELETE FROM content_refs`);
 }
 
 /**
@@ -144,4 +162,50 @@ export function getRelatedCount(sql: SqlStorage): number {
     .exec(`SELECT COUNT(*) as count FROM entities WHERE is_target = 0`)
     .one();
   return (row?.count as number) || 0;
+}
+
+/**
+ * Store a content reference (Gemini file URI)
+ */
+export function storeContentRef(sql: SqlStorage, ref: ContentRef): void {
+  sql.exec(
+    `INSERT OR REPLACE INTO content_refs (key, status, content_type, size, file_uri, reason) VALUES (?, ?, ?, ?, ?, ?)`,
+    ref.key,
+    ref.status,
+    ref.contentType || null,
+    ref.size || null,
+    ref.fileUri || null,
+    ref.reason || null
+  );
+}
+
+/**
+ * Read all content references
+ */
+export function readContentRefs(sql: SqlStorage): ContentRef[] {
+  const rows = sql.exec(`SELECT * FROM content_refs`).toArray();
+  return rows.map((row) => ({
+    key: row.key as string,
+    status: row.status as ContentRef['status'],
+    contentType: row.content_type as string | undefined,
+    size: row.size as number | undefined,
+    fileUri: row.file_uri as string | undefined,
+    reason: row.reason as string | undefined,
+  }));
+}
+
+/**
+ * Read only successful content references (with file URIs)
+ */
+export function readSuccessfulContentRefs(sql: SqlStorage): ContentRef[] {
+  const rows = sql
+    .exec(`SELECT * FROM content_refs WHERE status = 'success'`)
+    .toArray();
+  return rows.map((row) => ({
+    key: row.key as string,
+    status: 'success' as const,
+    contentType: row.content_type as string,
+    size: row.size as number,
+    fileUri: row.file_uri as string,
+  }));
 }

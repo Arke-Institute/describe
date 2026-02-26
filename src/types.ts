@@ -28,6 +28,11 @@ export interface DescribeConfig {
   predicates?: string[]; // Filter to specific predicates (default: all)
   batch_size?: number; // Entities per batch-get call (default: 100)
 
+  // Content handling (multimodal)
+  include_content?: boolean; // Enable content upload to Gemini (default: true)
+  content_keys?: string[]; // Specific keys to include (default: all keys)
+  max_content_size?: number; // Per-file size limit in bytes (default: 50MB for PDFs)
+
   // Token budget
   context_window_tokens?: number; // Model context window (default: 128000)
   max_output_tokens?: number; // Reserved for output (default: 8000)
@@ -47,6 +52,9 @@ export const DEFAULT_CONFIG: Required<DescribeConfig> = {
   max_relationships: 1000,
   predicates: [],
   batch_size: 100,
+  include_content: true,
+  content_keys: [], // Empty = all keys
+  max_content_size: 50 * 1024 * 1024, // 50MB (Gemini PDF limit)
   context_window_tokens: 128000,
   max_output_tokens: 8000,
   safety_margin: 0.8,
@@ -94,7 +102,30 @@ export interface DescribeResult {
 /**
  * Job phases for DO state machine
  */
-export type JobPhase = 'FETCH_TARGET' | 'FETCH_BATCH' | 'GENERATE' | 'DONE';
+export type JobPhase = 'FETCH_TARGET' | 'UPLOAD_CONTENT' | 'FETCH_BATCH' | 'GENERATE' | 'DONE';
+
+/**
+ * Content metadata from entity properties
+ */
+export interface ContentMetadata {
+  cid: string;
+  content_type: string;
+  filename?: string;
+  size: number;
+  uploaded_at: string;
+}
+
+/**
+ * Reference to uploaded content (stored in SQL)
+ */
+export interface ContentRef {
+  key: string;
+  status: 'success' | 'too_large' | 'not_found' | 'error';
+  contentType?: string;
+  size?: number;
+  fileUri?: string; // Gemini file URI
+  reason?: string; // Error/skip reason
+}
 
 /**
  * Relationship ID with predicate for batch fetching
@@ -112,6 +143,9 @@ export interface JobState {
   nextBatchIndex: number;
   totalRelationships: number;
   relationshipIds: RelationshipRef[];
+  // Content upload state
+  contentKeys: string[];
+  contentIndex: number;
 }
 
 /**

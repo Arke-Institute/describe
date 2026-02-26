@@ -9,7 +9,7 @@
 
 import type { ArkeClient } from '@arke-institute/sdk';
 import type { KladosLogger, KladosRequest, Output } from '@arke-institute/rhiza';
-import type { Env, DescribeConfig } from './types';
+import type { Env, DescribeConfig, ContentMetadata } from './types';
 import {
   initSchema,
   storeTarget,
@@ -18,6 +18,9 @@ import {
   getJobState,
   setJobState,
   clearState,
+  storeContentRef,
+  readContentRefs,
+  readSuccessfulContentRefs,
 } from './sql';
 import {
   fetchTarget,
@@ -28,7 +31,7 @@ import {
 } from './context';
 import { applyProgressiveTax, estimateTokens } from './truncation';
 import { buildSystemPrompt, buildUserPrompt, estimateSystemPromptTokens } from './prompts';
-import { callGeminiWithJsonRetry } from './gemini';
+import { callGeminiWithJsonRetry, streamToGeminiFiles, callGeminiMultimodal, parseDescribeResult } from './gemini';
 
 export interface ProcessContext {
   request: KladosRequest;
@@ -54,6 +57,9 @@ function parseConfig(input: Record<string, unknown> | undefined): Required<Descr
     max_relationships: (props.max_relationships as number) ?? 1000,
     predicates: (props.predicates as string[]) ?? [],
     batch_size: (props.batch_size as number) ?? 100,
+    include_content: (props.include_content as boolean) ?? true,
+    content_keys: (props.content_keys as string[]) ?? [],
+    max_content_size: (props.max_content_size as number) ?? 50 * 1024 * 1024, // 50MB
     context_window_tokens: (props.context_window_tokens as number) ?? 128000,
     max_output_tokens: (props.max_output_tokens as number) ?? 8000,
     safety_margin: (props.safety_margin as number) ?? 0.8,
@@ -61,6 +67,30 @@ function parseConfig(input: Record<string, unknown> | undefined): Required<Descr
     custom_instructions: (props.custom_instructions as string) ?? '',
     focus: (props.focus as string) ?? '',
   };
+}
+
+/**
+ * Get max size limit based on content type
+ */
+function getMaxSizeForType(contentType: string, configMax: number): number {
+  // PDF has stricter limit in Gemini
+  if (contentType === 'application/pdf') {
+    return Math.min(configMax, 50 * 1024 * 1024); // 50MB max for PDFs
+  }
+  // Images can be up to 100MB
+  if (contentType.startsWith('image/')) {
+    return Math.min(configMax, 100 * 1024 * 1024); // 100MB max for images
+  }
+  return configMax;
+}
+
+/**
+ * Format bytes as human-readable string
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 const CAS_MAX_RETRIES = 5;
@@ -163,19 +193,128 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
         config.max_relationships
       );
 
+      // Extract content keys to upload
+      let contentKeys: string[] = [];
+      if (config.include_content && target.properties.content) {
+        const allKeys = Object.keys(target.properties.content as Record<string, ContentMetadata>);
+        // Filter to requested keys if specified, otherwise use all
+        contentKeys = config.content_keys.length > 0
+          ? allKeys.filter(k => config.content_keys.includes(k))
+          : allKeys;
+      }
+
+      // Determine next phase
+      let nextPhase: 'UPLOAD_CONTENT' | 'FETCH_BATCH' | 'GENERATE';
+      if (contentKeys.length > 0) {
+        nextPhase = 'UPLOAD_CONTENT';
+      } else if (relIds.length > 0) {
+        nextPhase = 'FETCH_BATCH';
+      } else {
+        nextPhase = 'GENERATE';
+      }
+
       setJobState(sql, {
-        phase: relIds.length > 0 ? 'FETCH_BATCH' : 'GENERATE',
+        phase: nextPhase,
         nextBatchIndex: 0,
         totalRelationships: relIds.length,
         relationshipIds: relIds,
+        contentKeys,
+        contentIndex: 0,
       });
 
       logger.info('Fetched target', {
         id: target.id,
         type: target.type,
         relationshipsToFetch: relIds.length,
+        contentKeysToUpload: contentKeys.length,
       });
 
+      return { reschedule: true };
+    }
+
+    case 'UPLOAD_CONTENT': {
+      const { contentKeys, contentIndex, totalRelationships, relationshipIds } = state;
+      const key = contentKeys[contentIndex];
+
+      // Read target to get content metadata
+      const context = readAllEntities(sql);
+      const contentMap = context.target.properties.content as Record<string, ContentMetadata> | undefined;
+      const contentMeta = contentMap?.[key];
+
+      if (!contentMeta) {
+        logger.info('Content not found', { key });
+        storeContentRef(sql, { key, status: 'not_found', reason: 'No content at this key' });
+      } else {
+        const maxSize = getMaxSizeForType(contentMeta.content_type, config.max_content_size);
+
+        if (contentMeta.size > maxSize) {
+          logger.info('Content too large, skipping', {
+            key,
+            size: formatBytes(contentMeta.size),
+            limit: formatBytes(maxSize),
+          });
+          storeContentRef(sql, {
+            key,
+            status: 'too_large',
+            contentType: contentMeta.content_type,
+            size: contentMeta.size,
+            reason: `${formatBytes(contentMeta.size)} exceeds ${formatBytes(maxSize)} limit`,
+          });
+        } else {
+          // Stream upload to Gemini Files API
+          logger.info('Uploading content', {
+            key,
+            size: formatBytes(contentMeta.size),
+            type: contentMeta.content_type,
+          });
+
+          try {
+            const arkeBase = 'https://arke-v1.arke.institute'; // TODO: get from config
+            const result = await streamToGeminiFiles(
+              env.ARKE_AGENT_KEY,
+              env.GEMINI_API_KEY,
+              arkeBase,
+              request.target_entity!,
+              key,
+              contentMeta.content_type,
+              contentMeta.size
+            );
+
+            storeContentRef(sql, {
+              key,
+              status: 'success',
+              contentType: contentMeta.content_type,
+              size: contentMeta.size,
+              fileUri: result.fileUri,
+            });
+
+            logger.info('Content uploaded', { key, fileUri: result.fileUri });
+          } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            logger.error('Content upload failed', { key, error: errorMsg });
+            storeContentRef(sql, {
+              key,
+              status: 'error',
+              contentType: contentMeta.content_type,
+              size: contentMeta.size,
+              reason: errorMsg,
+            });
+          }
+        }
+      }
+
+      // Move to next content or next phase
+      const newIndex = contentIndex + 1;
+      if (newIndex < contentKeys.length) {
+        setJobState(sql, { contentIndex: newIndex });
+        logger.info('Content progress', { uploaded: newIndex, total: contentKeys.length });
+        return { reschedule: true };
+      }
+
+      // All content processed, move to next phase
+      const nextPhase = totalRelationships > 0 ? 'FETCH_BATCH' : 'GENERATE';
+      setJobState(sql, { phase: nextPhase });
+      logger.info('Content upload complete, moving to', { phase: nextPhase });
       return { reschedule: true };
     }
 
@@ -232,10 +371,26 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
       // Read all entities from SQL
       const context = readAllEntities(sql);
 
+      // Read content refs (uploaded to Gemini Files API)
+      const allContentRefs = readContentRefs(sql);
+      const successfulContent = readSuccessfulContentRefs(sql);
+      const skippedContent = allContentRefs.filter(r => r.status !== 'success');
+
       logger.info('Building context', {
         targetId: context.target.id,
         relatedCount: context.related.length,
+        contentFiles: successfulContent.length,
+        contentSkipped: skippedContent.length,
       });
+
+      // Log skipped content
+      for (const skipped of skippedContent) {
+        logger.info('Content skipped', {
+          key: skipped.key,
+          status: skipped.status,
+          reason: skipped.reason,
+        });
+      }
 
       // Calculate token budget
       const systemPromptTokens = estimateSystemPromptTokens(config);
@@ -262,19 +417,63 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
 
       // Build prompts
       const systemPrompt = buildSystemPrompt(config);
-      const userPrompt = buildUserPrompt(truncatedContext, config);
+      let userPrompt = buildUserPrompt(truncatedContext, config);
 
-      logger.info('Calling Gemini', {
-        systemPromptLength: systemPrompt.length,
-        userPromptLength: userPrompt.length,
-      });
+      // Add content info to prompt if we have files
+      if (successfulContent.length > 0) {
+        const contentInfo = successfulContent
+          .map(c => `- **${c.key}**: ${c.contentType} (${formatBytes(c.size!)})`)
+          .join('\n');
+        userPrompt = `## ATTACHED CONTENT\nThe following files are attached and included for analysis:\n${contentInfo}\n\n${userPrompt}`;
+      }
 
-      // Call Gemini with JSON retry (retries up to 3 times on parse failure)
-      const { response: geminiResponse, result } = await callGeminiWithJsonRetry(
-        env.GEMINI_API_KEY,
-        systemPrompt,
-        userPrompt
-      );
+      // Add skipped content note if any
+      if (skippedContent.length > 0) {
+        const skippedInfo = skippedContent
+          .map(c => `- **${c.key}**: ${c.reason}`)
+          .join('\n');
+        userPrompt += `\n\n## CONTENT NOT ANALYZED\nThe following content could not be included:\n${skippedInfo}`;
+      }
+
+      let geminiResponse;
+      let result;
+
+      if (successfulContent.length > 0) {
+        // Use multimodal API with file references
+        const fileRefs = successfulContent.map(c => ({
+          fileUri: c.fileUri!,
+          mimeType: c.contentType!,
+        }));
+
+        logger.info('Calling Gemini (multimodal)', {
+          systemPromptLength: systemPrompt.length,
+          userPromptLength: userPrompt.length,
+          fileCount: fileRefs.length,
+        });
+
+        geminiResponse = await callGeminiMultimodal(
+          env.GEMINI_API_KEY,
+          systemPrompt,
+          userPrompt,
+          fileRefs
+        );
+
+        result = parseDescribeResult(geminiResponse.content);
+      } else {
+        // Text-only API
+        logger.info('Calling Gemini (text-only)', {
+          systemPromptLength: systemPrompt.length,
+          userPromptLength: userPrompt.length,
+        });
+
+        const jsonResult = await callGeminiWithJsonRetry(
+          env.GEMINI_API_KEY,
+          systemPrompt,
+          userPrompt
+        );
+        geminiResponse = jsonResult.response;
+        result = jsonResult.result;
+      }
 
       logger.info('Gemini response', {
         tokens: geminiResponse.tokens,
@@ -288,6 +487,7 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
         descriptionLength: result.description.length,
         hasTitle: !!result.title,
         hasLabel: !!result.label,
+        multimodal: successfulContent.length > 0,
       });
 
       // Cleanup and return
