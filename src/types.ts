@@ -6,13 +6,24 @@
  * Worker environment bindings
  */
 export interface Env {
+  // Agent IDs per network
   AGENT_ID: string;
+  AGENT_ID_TEST?: string;
+  AGENT_ID_MAIN?: string;
   AGENT_VERSION: string;
+
+  // API keys per network (klados keys are network-specific)
   ARKE_AGENT_KEY: string;
+  ARKE_AGENT_KEY_TEST?: string;
+  ARKE_AGENT_KEY_MAIN?: string;
+
   GEMINI_API_KEY: string;
   VERIFICATION_TOKEN?: string;
   ARKE_VERIFY_AGENT_ID?: string;
   KLADOS_JOB: DurableObjectNamespace;
+
+  // Index signature for NetworkEnv compatibility
+  [key: string]: unknown;
 }
 
 /**
