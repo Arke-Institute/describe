@@ -213,6 +213,7 @@ export class KladosJobDO extends DurableObject<Env> {
         logger,
         sql: this.sql,
         env: this.env,
+        authToken: config.authToken,
       });
 
       // Handle reschedule

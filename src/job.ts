@@ -39,6 +39,8 @@ export interface ProcessContext {
   logger: KladosLogger;
   sql: SqlStorage;
   env: Env;
+  /** Network-specific auth token (from getKladosConfig) */
+  authToken: string;
 }
 
 export interface ProcessResult {
@@ -166,7 +168,7 @@ async function updateEntity(
  * - GENERATE: Build context, truncate, call LLM, update entity
  */
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
-  const { request, client, logger, sql, env } = ctx;
+  const { request, client, logger, sql, env, authToken } = ctx;
   const config = parseConfig(request.input);
 
   // Initialize schema on first run
@@ -271,7 +273,7 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
           try {
             const arkeBase = 'https://arke-v1.arke.institute'; // TODO: get from config
             const result = await streamToGeminiFiles(
-              env.ARKE_AGENT_KEY,
+              authToken,
               env.GEMINI_API_KEY,
               arkeBase,
               request.target_entity!,
