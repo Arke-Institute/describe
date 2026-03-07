@@ -3,6 +3,7 @@
  *
  * Adapted from kg-extractor for description generation.
  * Uses temperature 0.7 for balanced creativity/consistency.
+ * Uses responseSchema for guaranteed valid JSON output.
  */
 
 import type { DescribeResult } from './types';
@@ -33,6 +34,39 @@ export interface GeminiResponse {
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * JSON Schema for the describe result.
+ * When provided via responseSchema, Gemini guarantees valid JSON output.
+ */
+function getDescribeSchema(includeLabel: boolean) {
+  const properties: Record<string, unknown> = {
+    title: {
+      type: 'STRING',
+      description: 'Human-readable title for the entity',
+    },
+    description: {
+      type: 'STRING',
+      description: 'The generated description (markdown supported)',
+    },
+  };
+
+  const required = ['title', 'description'];
+
+  if (includeLabel) {
+    properties.label = {
+      type: 'STRING',
+      description: 'Concise label for the entity (2-5 words)',
+    };
+    required.push('label');
+  }
+
+  return {
+    type: 'OBJECT',
+    properties,
+    required,
+  };
 }
 
 /**
@@ -81,30 +115,54 @@ function parseGeminiResponse(data: unknown): GeminiResponse {
 }
 
 /**
- * Call Gemini API with JSON mode and retry logic
+ * Parse the JSON response from Gemini into a DescribeResult.
+ * With responseSchema, JSON.parse should always succeed.
+ * Fallback regex extraction kept as a safety net.
  */
-export async function callGemini(
-  apiKey: string,
-  systemPrompt: string,
-  userPrompt: string
+export function parseDescribeResult(content: string): DescribeResult {
+  try {
+    const parsed = JSON.parse(content);
+    return {
+      description: parsed.description || '',
+      title: parsed.title,
+      label: parsed.label,
+    };
+  } catch (e) {
+    // This should not happen with responseSchema, but log if it does
+    console.error('[Gemini] Unexpected JSON parse failure with responseSchema:', e);
+    console.error('[Gemini] Raw content:', content.slice(0, 500));
+
+    // Last-resort regex extraction
+    const descMatch = content.match(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    const titleMatch = content.match(/"title"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+
+    if (descMatch) {
+      console.warn('[Gemini] Recovered fields via regex extraction');
+      const unescape = (s: string) => s.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+      return {
+        description: unescape(descMatch[1]),
+        title: titleMatch ? unescape(titleMatch[1]) : undefined,
+      };
+    }
+
+    return { description: content };
+  }
+}
+
+/**
+ * Shared retry loop for Gemini API calls (HTTP-level retries).
+ * Handles rate limits, server errors, and timeouts.
+ */
+async function callGeminiWithRetry(
+  url: string,
+  body: unknown,
+  label: string
 ): Promise<GeminiResponse> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
-
-  const body = {
-    system_instruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-    generationConfig: {
-      maxOutputTokens: 8192, // Enough for descriptions
-      temperature: 0.7,
-      responseMimeType: 'application/json',
-    },
-  };
-
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      console.log(`[Gemini] Attempt ${attempt + 1}/${MAX_RETRIES + 1}...`);
+      console.log(`[Gemini] ${label} attempt ${attempt + 1}/${MAX_RETRIES + 1}...`);
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -144,7 +202,6 @@ export async function callGemini(
         .candidates?.[0]?.finishReason;
       console.log(`[Gemini] Finish reason: ${finishReason}`);
 
-      // Warn if output may be truncated
       if (finishReason === 'MAX_TOKENS') {
         console.warn('[Gemini] WARNING: Output truncated due to max tokens limit');
       }
@@ -165,109 +222,32 @@ export async function callGemini(
 }
 
 /**
- * Parse the JSON response from Gemini into a DescribeResult
+ * Call Gemini API with structured JSON output (text-only).
+ * Uses responseSchema to guarantee valid JSON.
  */
-export function parseDescribeResult(content: string): DescribeResult {
-  try {
-    const parsed = JSON.parse(content);
-
-    return {
-      description: parsed.description || '',
-      title: parsed.title,
-      label: parsed.label,
-    };
-  } catch (e) {
-    console.error('[Gemini] Failed to parse JSON response:', e);
-    // Fallback: treat the whole content as description
-    return {
-      description: content,
-    };
-  }
-}
-
-const JSON_PARSE_MAX_RETRIES = 3;
-
-/**
- * Call Gemini and parse JSON response with retry on parse failure
- *
- * If JSON parsing fails, retries with error context appended to prompt
- * so the model can correct its output.
- */
-export async function callGeminiWithJsonRetry(
+export async function callGemini(
   apiKey: string,
   systemPrompt: string,
-  userPrompt: string
+  userPrompt: string,
+  options?: { includeLabel?: boolean }
 ): Promise<{ response: GeminiResponse; result: DescribeResult }> {
-  let lastResponse: GeminiResponse | null = null;
-  let lastError: string | null = null;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
 
-  for (let attempt = 0; attempt < JSON_PARSE_MAX_RETRIES; attempt++) {
-    // Build prompt - append error context if retrying
-    let effectiveUserPrompt = userPrompt;
-    if (lastResponse && lastError) {
-      const truncatedContent = lastResponse.content.length > 2000
-        ? lastResponse.content.slice(0, 2000) + '...[truncated]'
-        : lastResponse.content;
+  const body = {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      maxOutputTokens: 8192,
+      temperature: 0.7,
+      responseMimeType: 'application/json',
+      responseSchema: getDescribeSchema(options?.includeLabel ?? false),
+    },
+  };
 
-      effectiveUserPrompt += `
+  const response = await callGeminiWithRetry(url, body, 'Text');
+  const result = parseDescribeResult(response.content);
 
-## RETRY - JSON PARSE ERROR
-
-Your previous response could not be parsed as valid JSON.
-
-**Error:** ${lastError}
-
-**Your response was:**
-\`\`\`
-${truncatedContent}
-\`\`\`
-
-Please provide a valid JSON response with the required fields: title, description.`;
-    }
-
-    // Call Gemini (has its own retry for HTTP errors)
-    const response = await callGemini(apiKey, systemPrompt, effectiveUserPrompt);
-
-    // Try to parse JSON
-    try {
-      const parsed = JSON.parse(response.content);
-
-      // Validate required fields
-      if (typeof parsed.description !== 'string') {
-        throw new Error('Missing or invalid "description" field');
-      }
-
-      if (attempt > 0) {
-        console.log(`[Gemini] JSON parsed successfully after ${attempt + 1} attempts`);
-      }
-
-      return {
-        response,
-        result: {
-          description: parsed.description,
-          title: parsed.title,
-          label: parsed.label,
-        }
-      };
-    } catch (e) {
-      lastResponse = response;
-      lastError = e instanceof Error ? e.message : String(e);
-
-      console.error(`[Gemini] JSON parse failed (attempt ${attempt + 1}/${JSON_PARSE_MAX_RETRIES}):`, lastError);
-
-      if (attempt < JSON_PARSE_MAX_RETRIES - 1) {
-        console.log('[Gemini] Retrying with error feedback...');
-      }
-    }
-  }
-
-  // All retries exhausted - throw error
-  const preview = lastResponse?.content.slice(0, 200) || 'no response';
-  throw new Error(
-    `Failed to get valid JSON after ${JSON_PARSE_MAX_RETRIES} attempts. ` +
-    `Last error: ${lastError}. ` +
-    `Last response preview: ${preview}...`
-  );
+  return { response, result };
 }
 
 /**
@@ -381,20 +361,21 @@ export async function streamToGeminiFiles(
 }
 
 /**
- * Call Gemini with multimodal content (text + files)
+ * Call Gemini with multimodal content (text + files).
+ * Uses responseSchema to guarantee valid JSON.
  */
 export async function callGeminiMultimodal(
   apiKey: string,
   systemPrompt: string,
   userPrompt: string,
-  fileRefs: Array<{ fileUri: string; mimeType: string }>
-): Promise<GeminiResponse> {
+  fileRefs: Array<{ fileUri: string; mimeType: string }>,
+  options?: { includeLabel?: boolean }
+): Promise<{ response: GeminiResponse; result: DescribeResult }> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
 
   // Build parts array: files first, then text
   const parts: Array<{ file_data?: { file_uri: string; mime_type: string }; text?: string }> = [];
 
-  // Add file references
   for (const ref of fileRefs) {
     parts.push({
       file_data: {
@@ -404,7 +385,6 @@ export async function callGeminiMultimodal(
     });
   }
 
-  // Add text prompt
   parts.push({ text: userPrompt });
 
   const body = {
@@ -414,66 +394,12 @@ export async function callGeminiMultimodal(
       maxOutputTokens: 8192,
       temperature: 0.7,
       responseMimeType: 'application/json',
+      responseSchema: getDescribeSchema(options?.includeLabel ?? false),
     },
   };
 
-  let lastError: Error | null = null;
+  const response = await callGeminiWithRetry(url, body, `Multimodal (${fileRefs.length} files)`);
+  const result = parseDescribeResult(response.content);
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      console.log(`[Gemini] Multimodal attempt ${attempt + 1}/${MAX_RETRIES + 1} with ${fileRefs.length} files...`);
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (response.status === 429 || response.status >= 500) {
-        const errorText = await response.text();
-        console.error(`[Gemini] Error ${response.status}: ${errorText}`);
-
-        if (attempt < MAX_RETRIES) {
-          const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
-          console.log(`[Gemini] Retrying in ${delay}ms...`);
-          await sleep(delay);
-          continue;
-        }
-        throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-      }
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-      }
-
-      const data = await response.json();
-
-      const finishReason = (data as { candidates?: Array<{ finishReason?: string }> })
-        .candidates?.[0]?.finishReason;
-      console.log(`[Gemini] Finish reason: ${finishReason}`);
-
-      if (finishReason === 'MAX_TOKENS') {
-        console.warn('[Gemini] WARNING: Output truncated due to max tokens limit');
-      }
-
-      return parseGeminiResponse(data);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-
-      if (attempt < MAX_RETRIES) {
-        const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
-        console.log(`[Gemini] Error: ${lastError.message}, retrying in ${delay}ms...`);
-        await sleep(delay);
-      }
-    }
-  }
-
-  throw lastError || new Error('Gemini multimodal request failed');
+  return { response, result };
 }

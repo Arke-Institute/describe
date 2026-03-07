@@ -31,7 +31,7 @@ import {
 } from './context';
 import { applyProgressiveTax, estimateTokens } from './truncation';
 import { buildSystemPrompt, buildUserPrompt, estimateSystemPromptTokens } from './prompts';
-import { callGeminiWithJsonRetry, streamToGeminiFiles, callGeminiMultimodal, parseDescribeResult } from './gemini';
+import { callGemini, streamToGeminiFiles, callGeminiMultimodal } from './gemini';
 
 export interface ProcessContext {
   request: KladosRequest;
@@ -196,9 +196,12 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
       );
 
       // Extract content keys to upload
+      // content property must be an object map of ContentMetadata, not a plain string
       let contentKeys: string[] = [];
-      if (config.include_content && target.properties.content) {
-        const allKeys = Object.keys(target.properties.content as Record<string, ContentMetadata>);
+      if (config.include_content && target.properties.content && typeof target.properties.content === 'object') {
+        const contentMap = target.properties.content as Record<string, ContentMetadata>;
+        // Validate entries have content_type (filters out non-ContentMetadata values)
+        const allKeys = Object.keys(contentMap).filter(k => contentMap[k]?.content_type);
         // Filter to requested keys if specified, otherwise use all
         contentKeys = config.content_keys.length > 0
           ? allKeys.filter(k => config.content_keys.includes(k))
@@ -439,6 +442,7 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
 
       let geminiResponse;
       let result;
+      const schemaOptions = { includeLabel: !!config.update_label };
 
       if (successfulContent.length > 0) {
         // Use multimodal API with file references
@@ -453,14 +457,15 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
           fileCount: fileRefs.length,
         });
 
-        geminiResponse = await callGeminiMultimodal(
+        const jsonResult = await callGeminiMultimodal(
           env.GEMINI_API_KEY,
           systemPrompt,
           userPrompt,
-          fileRefs
+          fileRefs,
+          schemaOptions
         );
-
-        result = parseDescribeResult(geminiResponse.content);
+        geminiResponse = jsonResult.response;
+        result = jsonResult.result;
       } else {
         // Text-only API
         logger.info('Calling Gemini (text-only)', {
@@ -468,10 +473,11 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
           userPromptLength: userPrompt.length,
         });
 
-        const jsonResult = await callGeminiWithJsonRetry(
+        const jsonResult = await callGemini(
           env.GEMINI_API_KEY,
           systemPrompt,
-          userPrompt
+          userPrompt,
+          schemaOptions
         );
         geminiResponse = jsonResult.response;
         result = jsonResult.result;
