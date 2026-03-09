@@ -8,7 +8,7 @@
  */
 
 import type { ArkeClient } from '@arke-institute/sdk';
-import type { KladosLogger, KladosRequest, Output } from '@arke-institute/rhiza';
+import type { KladosJob, Output } from '@arke-institute/rhiza';
 import type { Env, DescribeConfig, ContentMetadata } from './types';
 import {
   initSchema,
@@ -34,13 +34,10 @@ import { buildSystemPrompt, buildUserPrompt, estimateSystemPromptTokens } from '
 import { callGemini, streamToGeminiFiles, callGeminiMultimodal } from './gemini';
 
 export interface ProcessContext {
-  request: KladosRequest;
-  client: ArkeClient;
-  logger: KladosLogger;
+  /** KladosJob instance (provides client, logger, request, fetchTarget, etc.) */
+  job: KladosJob;
   sql: SqlStorage;
   env: Env;
-  /** Network-specific auth token (from getKladosConfig) */
-  authToken: string;
 }
 
 export interface ProcessResult {
@@ -168,7 +165,9 @@ async function updateEntity(
  * - GENERATE: Build context, truncate, call LLM, update entity
  */
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
-  const { request, client, logger, sql, env, authToken } = ctx;
+  const { job, sql, env } = ctx;
+  const { request, client, log: logger } = job;
+  const authToken = job.config.authToken!;
   const config = parseConfig(request.input);
 
   // Initialize schema on first run
