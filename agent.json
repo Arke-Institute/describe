@@ -59,82 +59,93 @@
     },
 
     "klados_input": {
-      "description": "Parameters passed via the rhiza workflow input field to customize description generation.",
+      "description": "Parameters passed via the rhiza workflow input field to customize description generation. Properties map directly to keys in request.input.",
       "properties": {
-        "optional": {
-          "update_label": {
-            "type": "boolean",
-            "description": "If true, also generates and updates a concise label (2-5 words) for the entity.",
-            "default": false
-          },
-          "max_relationships": {
-            "type": "integer",
-            "description": "Maximum number of relationships to fetch for context.",
-            "default": 1000,
-            "minimum": 0,
-            "maximum": 10000
-          },
-          "predicates": {
-            "type": "string[]",
-            "description": "Filter to only fetch relationships with these predicates. Empty array means all predicates.",
-            "default": [],
-            "examples": [["contains", "extracted_from"], ["cluster_member"]]
-          },
-          "batch_size": {
-            "type": "integer",
-            "description": "Number of entities to fetch per batch-get call.",
-            "default": 100,
-            "minimum": 1,
-            "maximum": 500
-          },
-          "context_window_tokens": {
-            "type": "integer",
-            "description": "Model context window size for token budget calculation.",
-            "default": 128000
-          },
-          "max_output_tokens": {
-            "type": "integer",
-            "description": "Tokens reserved for model output.",
-            "default": 8000
-          },
-          "safety_margin": {
-            "type": "number",
-            "description": "Buffer ratio to avoid hitting token limits. 0.8 means use 80% of available budget.",
-            "default": 0.8,
-            "minimum": 0.5,
-            "maximum": 1.0
-          },
-          "style": {
-            "type": "string",
-            "description": "Writing style for the generated description.",
-            "enum": ["concise", "detailed", "academic", "casual"],
-            "default": "detailed"
-          },
-          "custom_instructions": {
-            "type": "string",
-            "description": "Additional instructions appended to the system prompt for customizing output."
-          },
-          "focus": {
-            "type": "string",
-            "description": "What aspect of the entity to emphasize in the description."
-          },
-          "include_content": {
-            "type": "boolean",
-            "description": "Whether to upload and include file content from properties.content in the prompt.",
-            "default": true
-          },
-          "content_keys": {
-            "type": "string[]",
-            "description": "Specific content keys to include. If omitted, all content keys are included.",
-            "default": "all keys",
-            "examples": [["original", "thumbnail"], ["page_001.jpeg", "page_002.jpeg"]]
-          },
-          "max_content_size": {
-            "type": "integer",
-            "description": "Maximum file size in bytes to upload. Larger files are skipped with 'too_large' status.",
-            "default": 52428800,
-            "notes": "Default is 50MB. Set lower to skip large files and rely on text context only."
-          }
+        "update_label": {
+          "type": "boolean",
+          "required": false,
+          "description": "If true, also generates and updates a concise label (2-5 words) for the entity.",
+          "default": false
+        },
+        "max_relationships": {
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of relationships to fetch for context.",
+          "default": 1000,
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "predicates": {
+          "type": "string[]",
+          "required": false,
+          "description": "Filter to only fetch relationships with these predicates. Empty array means all predicates.",
+          "default": [],
+          "examples": [["contains", "extracted_from"], ["cluster_member"]]
+        },
+        "batch_size": {
+          "type": "integer",
+          "required": false,
+          "description": "Number of entities to fetch per batch-get call.",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500
+        },
+        "context_window_tokens": {
+          "type": "integer",
+          "required": false,
+          "description": "Model context window size for token budget calculation.",
+          "default": 128000
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "required": false,
+          "description": "Tokens reserved for model output.",
+          "default": 8000
+        },
+        "safety_margin": {
+          "type": "number",
+          "required": false,
+          "description": "Buffer ratio to avoid hitting token limits. 0.8 means use 80% of available budget.",
+          "default": 0.8,
+          "minimum": 0.5,
+          "maximum": 1.0
+        },
+        "style": {
+          "type": "string",
+          "required": false,
+          "description": "Writing style for the generated description.",
+          "enum": ["concise", "detailed", "academic", "casual"],
+          "default": "detailed"
+        },
+        "custom_instructions": {
+          "type": "string",
+          "required": false,
+          "description": "Additional instructions appended to the system prompt for customizing output."
+        },
+        "focus": {
+          "type": "string",
+          "required": false,
+          "description": "What aspect of the entity to emphasize in the description."
+        },
+        "include_content": {
+          "type": "boolean",
+          "required": false,
+          "description": "Whether to upload and include file content from properties.content in the prompt.",
+          "default": true
+        },
+        "content_keys": {
+          "type": "string[]",
+          "required": false,
+          "description": "Specific content keys to include. If omitted, all content keys are included.",
+          "default": "all keys",
+          "examples": [["original", "thumbnail"], ["page_001.jpeg", "page_002.jpeg"]]
+        },
+        "max_content_size": {
+          "type": "integer",
+          "required": false,
+          "description": "Maximum file size in bytes to upload. Larger files are skipped with 'too_large' status.",
+          "default": 52428800,
+          "notes": "Default is 50MB. Set lower to skip large files and rely on text context only."
         }
       }
     },
